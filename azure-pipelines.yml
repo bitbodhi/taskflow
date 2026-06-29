@@ -1,0 +1,101 @@
+# TaskFlow CI/CD — deterministic gates only. AI review runs locally pre-PR (Claude Code).
+trigger:
+  branches: { include: [ main ] }
+pr:
+  branches: { include: [ main ] }
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: taskflow-secrets
+  - name: azureServiceConnection
+    value: 'taskflow-azure-oidc'          # from 3.5 (Project settings → Service connections)
+  - name: resourceGroup
+    value: 'rg-taskflow'                  # from 3.6
+  - name: sonarOrg
+    value: 'bitbodhi'                     # from 3.7
+  - name: sonarProjectKey
+    value: 'bitbodhi_taskflow'            # from 3.7
+  - name: codeReady
+    value: 'false'                        # EPIC-0 flips this to 'true' when src/ + infra/ exist
+
+stages:
+  # ---------- Runs NOW: proves all the wiring is correct ----------
+  - stage: Validate
+    displayName: Validate wiring
+    jobs:
+      - job: wiring
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: Prove OIDC service connection → Azure
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: az account show --output table
+          - bash: |
+              if [ -z "$SENTRY_AUTH_TOKEN" ]; then echo "##[error]SENTRY_AUTH_TOKEN missing from variable group"; exit 1; fi
+              echo "Secret variable group resolves (value masked). Wiring OK."
+            displayName: Confirm secret variable group
+            env:
+              SENTRY_AUTH_TOKEN: $(SENTRY_AUTH_TOKEN)
+
+  # ---------- Skipped until EPIC-0 (codeReady=true) ----------
+  - stage: CI
+    displayName: Build · Test · Sonar · Lighthouse
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['codeReady'], 'true'))
+    jobs:
+      - job: build_test_scan
+        steps:
+          - checkout: self
+            fetchDepth: 0                      # Sonar new-code detection needs full history
+          - task: UseDotNet@2
+            inputs: { packageType: sdk, version: '10.x' }
+          - task: SonarCloudPrepare@2
+            inputs:
+              SonarCloud: 'SonarCloud'         # the service connection from 3.9.1
+              organization: '$(sonarOrg)'
+              scannerMode: 'MSBuild'
+              projectKey: '$(sonarProjectKey)'
+          - bash: dotnet restore && dotnet build -c Release --no-restore   # EPIC-0: point at the .sln
+            displayName: Build (.NET 10 API)
+          - bash: dotnet test -c Release --collect:"XPlat Code Coverage"
+            displayName: Test + coverage
+          - task: SonarCloudAnalyze@2
+          - task: SonarCloudPublish@2
+            inputs: { pollingTimeoutSec: '300' }   # fails the build if the quality gate fails
+          - task: NodeTool@0
+            inputs: { versionSpec: '20.x' }
+          - bash: cd src/web && npm ci && npm run build      # EPIC-0: confirm SPA path
+            displayName: Build SPA (Vue 3)
+          - bash: npm i -g @lhci/cli && lhci autorun         # EPIC-0: add lighthouserc
+            displayName: Lighthouse (a11y hard gate)
+
+  # ---------- Skipped until EPIC-0; main branch only ----------
+  - stage: Deploy
+    displayName: Deploy (ephemeral Azure)
+    dependsOn: CI
+    condition: and(succeeded(), eq(variables['codeReady'], 'true'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: deploy
+        environment: 'taskflow-ephemeral'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Provision infra (Bicep)
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az deployment group create -g $(resourceGroup) \
+                        --template-file infra/main.bicep \
+                        --parameters infra/params.dev.json
+                # EPIC-0 adds: deploy API + SPA to the two App Services (AzureWebApp@1),
+                #              EF migrate (expand-contract, JIT SQL-firewall),
+                #              Sentry release + source-map upload.
