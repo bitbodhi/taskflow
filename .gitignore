@@ -427,3 +427,22 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# --- Delivery Spine framework: lives in the PRIVATE repo, never commit here ---
+/.claude
+/.claude/
+/CLAUDE.md
+/PILOT.md
+
+# --- Node / Vue / Vite ---
+node_modules/
+dist/
+.vite/
+*.local
+
+# --- Secrets & local config — never commit ---
+appsettings.Development.json
+.env
+.env.*
+*.user
+src/web/public/config.json
